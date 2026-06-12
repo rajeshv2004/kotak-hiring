@@ -27,145 +27,135 @@ function base64url(input: ArrayBuffer | Uint8Array | string): string {
 }
 
 function pemToDer(pem: string): Uint8Array {
-  // Strip any surrounding quotes and whitespace
   const trimmed = pem.trim().replace(/^"|"$/g, "").trim();
-  console.log("PEM begins with:", trimmed.substring(0, 40));
-  console.log("PEM ends with:", trimmed.substring(trimmed.length - 40));
-
   const cleaned = trimmed
     .replace(/-----BEGIN [^-]+-----/g, "")
     .replace(/-----END [^-]+-----/g, "")
     .replace(/\s+/g, "");
 
-  console.log("Cleaned base64 length:", cleaned.length);
   try {
     const bin = atob(cleaned);
     const der = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) der[i] = bin.charCodeAt(i);
     return der;
-  } catch (err) {
-    console.error("Failed to decode base64 PEM in pemToDer:", err);
-    throw err;
+  } catch (err: any) {
+    console.error("JWT signing failed at pemToDer (atob decoding):", err);
+    throw new Error(`[JWT signing] Failed to decode private key base64. Underlying error: ${err?.message || err}`);
   }
 }
 
 async function getGoogleAccessToken(): Promise<string> {
+  // 1. ENV loading check
   const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const rawKey = process.env.GOOGLE_PRIVATE_KEY;
   
-  console.log("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL:", email);
-  console.log("AUDIT - GOOGLE_PRIVATE_KEY exists:", !!rawKey);
-  if (rawKey) {
-    console.log("AUDIT - GOOGLE_PRIVATE_KEY raw prefix:", rawKey.substring(0, 40));
-  }
-
   if (!email || !rawKey) {
-    throw new Error("Google service account credentials are not configured.");
+    console.error("DIAGNOSTIC - [ENV loading] GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY is missing.");
+    throw new Error("[ENV loading] GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY is missing from environment variables.");
   }
 
-  // Clean the PEM key
-  const privateKeyPem = rawKey.replace(/^"|"$/g, "").replace(/\\n/g, "\n");
-  console.log("AUDIT - privateKeyPem starts with RSA?", privateKeyPem.includes("BEGIN RSA PRIVATE KEY"));
-  console.log("AUDIT - privateKeyPem starts with standard PRIVATE KEY?", privateKeyPem.includes("BEGIN PRIVATE KEY"));
-
-  const now = Math.floor(Date.now() / 1000);
-  const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const payload = base64url(
-    JSON.stringify({
-      iss: email,
-      scope: "https://www.googleapis.com/auth/spreadsheets",
-      aud: "https://oauth2.googleapis.com/token",
-      exp: now + 3600,
-      iat: now,
-    }),
-  );
-  const signingInput = `${header}.${payload}`;
-  console.log("AUDIT - JWT signingInput:", signingInput);
-
-  let der: Uint8Array;
+  // 2. JWT signing
+  let jwt: string;
   try {
-    der = pemToDer(privateKeyPem);
-    console.log("AUDIT - DER byte length:", der.byteLength);
-  } catch (err) {
-    console.error("AUDIT - Failed to convert PEM to DER:", err);
-    throw err;
-  }
+    const privateKeyPem = rawKey.replace(/^"|"$/g, "").replace(/\\n/g, "\n");
+    const now = Math.floor(Date.now() / 1000);
+    const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+    const payload = base64url(
+      JSON.stringify({
+        iss: email,
+        scope: "https://www.googleapis.com/auth/spreadsheets",
+        aud: "https://oauth2.googleapis.com/token",
+        exp: now + 3600,
+        iat: now,
+      }),
+    );
+    const signingInput = `${header}.${payload}`;
 
-  let cryptoKey: CryptoKey;
-  try {
-    cryptoKey = await crypto.subtle.importKey(
+    const der = pemToDer(privateKeyPem);
+    const cryptoKey = await crypto.subtle.importKey(
       "pkcs8",
       der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer,
       { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
       false,
       ["sign"],
     );
-    console.log("AUDIT - CryptoKey imported successfully");
-  } catch (err) {
-    console.error("AUDIT - CryptoKey import failed (crypto.subtle.importKey):", err);
-    throw err;
-  }
-
-  let signature: ArrayBuffer;
-  try {
-    signature = await crypto.subtle.sign(
+    const signature = await crypto.subtle.sign(
       "RSASSA-PKCS1-v1_5",
       cryptoKey,
       new TextEncoder().encode(signingInput),
     );
-    console.log("AUDIT - Signature generated successfully");
-  } catch (err) {
-    console.error("AUDIT - Signing failed:", err);
-    throw err;
+    jwt = `${signingInput}.${base64url(signature)}`;
+    console.log("DIAGNOSTIC - [JWT signing] JWT successfully generated.");
+  } catch (err: any) {
+    console.error("DIAGNOSTIC - [JWT signing] Error:", err);
+    throw new Error(`[JWT signing] failed: ${err?.message || err}`);
   }
 
-  const jwt = `${signingInput}.${base64url(signature)}`;
-  console.log("AUDIT - JWT created: length =", jwt.length);
+  // 3. Token exchange
+  console.log("DIAGNOSTIC - Starting [Token exchange] fetch...");
+  let res: Response;
+  try {
+    res = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+    });
+  } catch (err: any) {
+    console.error("DIAGNOSTIC - [Token exchange] Network/fetch error:", err);
+    throw new Error(`[Token exchange] Network fetch failed: ${err?.message || err}`);
+  }
 
-  console.log("AUDIT - Fetching Google token...");
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
-  });
+  const responseText = await res.text();
+  console.log("DIAGNOSTIC - [Token exchange] HTTP status:", res.status);
+  console.log("DIAGNOSTIC - [Token exchange] response body:", responseText);
 
   if (!res.ok) {
-    const text = await res.text();
-    console.error(`AUDIT - Google token exchange response error: ${res.status} ${text}`);
-    throw new Error(`Google token exchange failed: ${res.status} ${text}`);
+    let failingStep = "[Token exchange] error";
+    if (res.status === 400 || res.status === 401) {
+      failingStep = "[Invalid credentials]";
+    }
+    throw new Error(`${failingStep}: HTTP ${res.status} - Response: ${responseText}`);
   }
 
-  const json = (await res.json()) as { access_token?: string };
+  let json: { access_token?: string };
+  try {
+    json = JSON.parse(responseText);
+  } catch (err: any) {
+    throw new Error(`[Token exchange] failed to parse JSON response. Text: ${responseText}`);
+  }
+
   if (!json.access_token) {
-    console.error("AUDIT - Google token response missing access_token", json);
-    throw new Error("Google token response missing access_token");
+    throw new Error(`[Token exchange] missing access_token in JSON response: ${responseText}`);
   }
 
-  console.log("AUDIT - Google token exchange response success, access token obtained.");
+  console.log("DIAGNOSTIC - [Token exchange] Success.");
   return json.access_token;
 }
 
 export const syncToSheets = createServerFn({ method: "POST" })
   .validator(ApplicationSchema)
   .handler(async ({ data }) => {
-    console.log("AUDIT - syncToSheets starting");
-    console.log("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL:", process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
+    console.log("DIAGNOSTIC - syncToSheets starting");
+    
+    // Check sheet ID env
     const sheetId = process.env.GOOGLE_SHEET_ID;
-    console.log("AUDIT - GOOGLE_SHEET_ID:", sheetId);
-    console.log("AUDIT - Form Data:", data);
+    if (!sheetId) {
+      console.error("DIAGNOSTIC - [ENV loading] GOOGLE_SHEET_ID is missing.");
+      throw new Error("[ENV loading] GOOGLE_SHEET_ID is missing from environment variables.");
+    }
 
-    if (!sheetId) throw new Error("GOOGLE_SHEET_ID is not configured.");
-
+    // Wrap token generation in try/catch to expose structured details
     let token: string;
     try {
       token = await getGoogleAccessToken();
-    } catch (err) {
-      console.error("AUDIT - getGoogleAccessToken failed:", err);
-      throw err;
+      console.log("DIAGNOSTIC - token generation success");
+    } catch (err: any) {
+      console.error("DIAGNOSTIC - token generation failure:", err);
+      // Return structured error
+      throw new Error(`Token Generation Failed: ${err?.message || err}`);
     }
 
     const timestamp = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-
     const row = [
       data.full_name,
       data.email,
@@ -179,32 +169,49 @@ export const syncToSheets = createServerFn({ method: "POST" })
     ];
 
     const range = "Sheet1!A1:append";
-    console.log("AUDIT - Access Token received:", token.substring(0, 15) + "...");
-    console.log("AUDIT - Target spreadsheet ID:", sheetId);
-    console.log("AUDIT - Target range:", range);
+    console.log("DIAGNOSTIC - Target range:", range);
+    console.log("DIAGNOSTIC - Target spreadsheet ID:", sheetId);
 
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}?valueInputOption=USER_ENTERED`;
-    console.log("AUDIT - Appending to Sheets: URL =", url);
+    console.log("DIAGNOSTIC - Starting [Sheets append] fetch...");
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ values: [row] }),
-    });
-
-    console.log("AUDIT - Sheets API response status:", res.status);
-    if (!res.ok) {
-      const text = await res.text();
-      console.error(`AUDIT - Sheets append response error: ${res.status} ${text}`);
-      throw new Error(`Sheets append failed: ${res.status} ${text}`);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ values: [row] }),
+      });
+    } catch (err: any) {
+      console.error("DIAGNOSTIC - [Sheets append] fetch/network error:", err);
+      throw new Error(`[Sheets append] Network fetch failed: ${err?.message || err}`);
     }
 
-    const resJson = await res.json();
-    console.log("AUDIT - Sheets append response success:", resJson);
+    const resText = await res.text();
+    console.log("DIAGNOSTIC - [Sheets append] HTTP status:", res.status);
+    console.log("DIAGNOSTIC - [Sheets append] response body:", resText);
 
+    if (!res.ok) {
+      let failingStep = "[Sheets append]";
+      if (res.status === 403) {
+        failingStep = "[Permission denied]";
+      } else if (res.status === 404) {
+        failingStep = "[Spreadsheet not found]";
+      }
+      throw new Error(`${failingStep}: HTTP ${res.status} - Response: ${resText}`);
+    }
+
+    let resJson;
+    try {
+      resJson = JSON.parse(resText);
+    } catch (err: any) {
+      console.error("DIAGNOSTIC - [Sheets append] Failed to parse success JSON:", err);
+    }
+
+    console.log("DIAGNOSTIC - [Sheets append] response success:", resJson);
     return { ok: true };
   });
 
