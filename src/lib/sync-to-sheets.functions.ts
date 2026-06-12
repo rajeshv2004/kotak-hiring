@@ -37,9 +37,21 @@ function pemToDer(pem: string): Uint8Array {
   return der;
 }
 
+function cleanEnvValue(val: string | undefined): string {
+  if (!val) return "";
+  let cleaned = val.trim();
+  if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
+    cleaned = cleaned.slice(1, -1);
+  }
+  if (cleaned.startsWith("'") && cleaned.endsWith("'")) {
+    cleaned = cleaned.slice(1, -1);
+  }
+  return cleaned;
+}
+
 async function getGoogleAccessToken(): Promise<string> {
-  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const rawKey = process.env.GOOGLE_PRIVATE_KEY;
+  const email = cleanEnvValue(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
+  const rawKey = cleanEnvValue(process.env.GOOGLE_PRIVATE_KEY);
   if (!email || !rawKey) {
     throw new Error("Google service account credentials are not configured.");
   }
@@ -90,10 +102,10 @@ async function getGoogleAccessToken(): Promise<string> {
 export const syncToSheets = createServerFn({ method: "POST" })
   .validator(ApplicationSchema)
   .handler(async ({ data }) => {
-    console.log("EMAIL:", process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
-    console.log("SHEET_ID:", process.env.GOOGLE_SHEET_ID);
+    console.log("EMAIL:", cleanEnvValue(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL));
+    console.log("SHEET_ID:", cleanEnvValue(process.env.GOOGLE_SHEET_ID));
     console.log("DATA:", data);
-    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const sheetId = cleanEnvValue(process.env.GOOGLE_SHEET_ID);
     if (!sheetId) throw new Error("GOOGLE_SHEET_ID is not configured.");
 
     const token = await getGoogleAccessToken();
