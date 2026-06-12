@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: kotak-insurance-careers
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
