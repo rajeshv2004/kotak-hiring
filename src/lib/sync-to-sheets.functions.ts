@@ -27,35 +27,46 @@ function base64url(input: ArrayBuffer | Uint8Array | string): string {
 }
 
 function pemToDer(pem: string): Uint8Array {
-  const cleaned = pem
+  // Strip any surrounding quotes and whitespace
+  const trimmed = pem.trim().replace(/^"|"$/g, "").trim();
+  console.log("PEM begins with:", trimmed.substring(0, 40));
+  console.log("PEM ends with:", trimmed.substring(trimmed.length - 40));
+
+  const cleaned = trimmed
     .replace(/-----BEGIN [^-]+-----/g, "")
     .replace(/-----END [^-]+-----/g, "")
     .replace(/\s+/g, "");
-  const bin = atob(cleaned);
-  const der = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) der[i] = bin.charCodeAt(i);
-  return der;
-}
 
-function cleanEnvValue(val: string | undefined): string {
-  if (!val) return "";
-  let cleaned = val.trim();
-  if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
-    cleaned = cleaned.slice(1, -1);
+  console.log("Cleaned base64 length:", cleaned.length);
+  try {
+    const bin = atob(cleaned);
+    const der = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) der[i] = bin.charCodeAt(i);
+    return der;
+  } catch (err) {
+    console.error("Failed to decode base64 PEM in pemToDer:", err);
+    throw err;
   }
-  if (cleaned.startsWith("'") && cleaned.endsWith("'")) {
-    cleaned = cleaned.slice(1, -1);
-  }
-  return cleaned;
 }
 
 async function getGoogleAccessToken(): Promise<string> {
-  const email = cleanEnvValue(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
-  const rawKey = cleanEnvValue(process.env.GOOGLE_PRIVATE_KEY);
+  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const rawKey = process.env.GOOGLE_PRIVATE_KEY;
+  
+  console.log("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL:", email);
+  console.log("AUDIT - GOOGLE_PRIVATE_KEY exists:", !!rawKey);
+  if (rawKey) {
+    console.log("AUDIT - GOOGLE_PRIVATE_KEY raw prefix:", rawKey.substring(0, 40));
+  }
+
   if (!email || !rawKey) {
     throw new Error("Google service account credentials are not configured.");
   }
-  const privateKeyPem = rawKey.replace(/\\n/g, "\n");
+
+  // Clean the PEM key
+  const privateKeyPem = rawKey.replace(/^"|"$/g, "").replace(/\\n/g, "\n");
+  console.log("AUDIT - privateKeyPem starts with RSA?", privateKeyPem.includes("BEGIN RSA PRIVATE KEY"));
+  console.log("AUDIT - privateKeyPem starts with standard PRIVATE KEY?", privateKeyPem.includes("BEGIN PRIVATE KEY"));
 
   const now = Math.floor(Date.now() / 1000);
   const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
@@ -69,46 +80,90 @@ async function getGoogleAccessToken(): Promise<string> {
     }),
   );
   const signingInput = `${header}.${payload}`;
+  console.log("AUDIT - JWT signingInput:", signingInput);
 
-  const der = pemToDer(privateKeyPem);
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8",
-    der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    new TextEncoder().encode(signingInput),
-  );
+  let der: Uint8Array;
+  try {
+    der = pemToDer(privateKeyPem);
+    console.log("AUDIT - DER byte length:", der.byteLength);
+  } catch (err) {
+    console.error("AUDIT - Failed to convert PEM to DER:", err);
+    throw err;
+  }
+
+  let cryptoKey: CryptoKey;
+  try {
+    cryptoKey = await crypto.subtle.importKey(
+      "pkcs8",
+      der.buffer.slice(der.byteOffset, der.byteOffset + der.byteLength) as ArrayBuffer,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    console.log("AUDIT - CryptoKey imported successfully");
+  } catch (err) {
+    console.error("AUDIT - CryptoKey import failed (crypto.subtle.importKey):", err);
+    throw err;
+  }
+
+  let signature: ArrayBuffer;
+  try {
+    signature = await crypto.subtle.sign(
+      "RSASSA-PKCS1-v1_5",
+      cryptoKey,
+      new TextEncoder().encode(signingInput),
+    );
+    console.log("AUDIT - Signature generated successfully");
+  } catch (err) {
+    console.error("AUDIT - Signing failed:", err);
+    throw err;
+  }
+
   const jwt = `${signingInput}.${base64url(signature)}`;
+  console.log("AUDIT - JWT created: length =", jwt.length);
 
+  console.log("AUDIT - Fetching Google token...");
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
   });
+
   if (!res.ok) {
     const text = await res.text();
+    console.error(`AUDIT - Google token exchange response error: ${res.status} ${text}`);
     throw new Error(`Google token exchange failed: ${res.status} ${text}`);
   }
+
   const json = (await res.json()) as { access_token?: string };
-  if (!json.access_token) throw new Error("Google token response missing access_token");
+  if (!json.access_token) {
+    console.error("AUDIT - Google token response missing access_token", json);
+    throw new Error("Google token response missing access_token");
+  }
+
+  console.log("AUDIT - Google token exchange response success, access token obtained.");
   return json.access_token;
 }
 
 export const syncToSheets = createServerFn({ method: "POST" })
   .validator(ApplicationSchema)
   .handler(async ({ data }) => {
-    console.log("EMAIL:", cleanEnvValue(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL));
-    console.log("SHEET_ID:", cleanEnvValue(process.env.GOOGLE_SHEET_ID));
-    console.log("DATA:", data);
-    const sheetId = cleanEnvValue(process.env.GOOGLE_SHEET_ID);
+    console.log("AUDIT - syncToSheets starting");
+    console.log("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL:", process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    console.log("AUDIT - GOOGLE_SHEET_ID:", sheetId);
+    console.log("AUDIT - Form Data:", data);
+
     if (!sheetId) throw new Error("GOOGLE_SHEET_ID is not configured.");
 
-    const token = await getGoogleAccessToken();
+    let token: string;
+    try {
+      token = await getGoogleAccessToken();
+    } catch (err) {
+      console.error("AUDIT - getGoogleAccessToken failed:", err);
+      throw err;
+    }
+
     const timestamp = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
 
     const row = [
@@ -123,7 +178,14 @@ export const syncToSheets = createServerFn({ method: "POST" })
       timestamp,
     ];
 
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Sheet1!A1:append?valueInputOption=USER_ENTERED`;
+    const range = "Sheet1!A1:append";
+    console.log("AUDIT - Access Token received:", token.substring(0, 15) + "...");
+    console.log("AUDIT - Target spreadsheet ID:", sheetId);
+    console.log("AUDIT - Target range:", range);
+
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}?valueInputOption=USER_ENTERED`;
+    console.log("AUDIT - Appending to Sheets: URL =", url);
+
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -132,9 +194,17 @@ export const syncToSheets = createServerFn({ method: "POST" })
       },
       body: JSON.stringify({ values: [row] }),
     });
+
+    console.log("AUDIT - Sheets API response status:", res.status);
     if (!res.ok) {
       const text = await res.text();
+      console.error(`AUDIT - Sheets append response error: ${res.status} ${text}`);
       throw new Error(`Sheets append failed: ${res.status} ${text}`);
     }
+
+    const resJson = await res.json();
+    console.log("AUDIT - Sheets append response success:", resJson);
+
     return { ok: true };
   });
+
