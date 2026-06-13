@@ -12,6 +12,60 @@ const ApplicationSchema = z.object({
   message: z.string().max(300).optional().default(""),
 });
 
+async function logAudit(message: string, isError = false) {
+  const formatted = `[${new Date().toISOString()}] ${isError ? "ERROR" : "INFO"}: ${message}\n`;
+  if (isError) {
+    console.error(formatted.trim());
+  } else {
+    console.log(formatted.trim());
+  }
+  if (typeof window === "undefined") {
+    try {
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      const logPath = path.resolve("c:/Users/rajes/Downloads/kotak-insurance-careers", "sync-audit.log");
+      fs.appendFileSync(logPath, formatted, "utf8");
+    } catch (err) {
+      // ignore
+    }
+  }
+}
+
+async function loadEnvIfNeeded() {
+  if (typeof window === "undefined") {
+    if (!process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY) {
+      try {
+        const fs = await import("node:fs");
+        const path = await import("node:path");
+        const envPath = path.resolve("c:/Users/rajes/Downloads/kotak-insurance-careers", ".env");
+        if (fs.existsSync(envPath)) {
+          const content = fs.readFileSync(envPath, "utf8");
+          content.split("\n").forEach((line) => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith("#")) return;
+            const eqIdx = trimmed.indexOf("=");
+            if (eqIdx === -1) return;
+            const key = trimmed.substring(0, eqIdx).trim();
+            let val = trimmed.substring(eqIdx + 1).trim();
+            if (val.startsWith('"') && val.endsWith('"')) {
+              val = val.substring(1, val.length - 1);
+            } else if (val.startsWith("'") && val.endsWith("'")) {
+              val = val.substring(1, val.length - 1);
+            }
+            val = val.replace(/\\n/g, "\n");
+            process.env[key] = val;
+          });
+          await logAudit("Loaded environment variables from .env file successfully.");
+        } else {
+          await logAudit(".env file not found at " + envPath, true);
+        }
+      } catch (err) {
+        await logAudit("Error loading .env file: " + (err as Error).message, true);
+      }
+    }
+  }
+}
+
 function base64url(input: ArrayBuffer | Uint8Array | string): string {
   let bytes: Uint8Array;
   if (typeof input === "string") {
@@ -26,47 +80,48 @@ function base64url(input: ArrayBuffer | Uint8Array | string): string {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function pemToDer(pem: string): Uint8Array {
-  // Strip any surrounding quotes and whitespace
+async function pemToDer(pem: string): Promise<Uint8Array> {
   const trimmed = pem.trim().replace(/^"|"$/g, "").trim();
-  console.log("PEM begins with:", trimmed.substring(0, 40));
-  console.log("PEM ends with:", trimmed.substring(trimmed.length - 40));
+  await logAudit("PEM begins with: " + trimmed.substring(0, 40));
+  await logAudit("PEM ends with: " + trimmed.substring(trimmed.length - 40));
 
   const cleaned = trimmed
     .replace(/-----BEGIN [^-]+-----/g, "")
     .replace(/-----END [^-]+-----/g, "")
     .replace(/\s+/g, "");
 
-  console.log("Cleaned base64 length:", cleaned.length);
+  await logAudit("Cleaned base64 length: " + cleaned.length);
   try {
     const bin = atob(cleaned);
     const der = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) der[i] = bin.charCodeAt(i);
     return der;
   } catch (err) {
-    console.error("Failed to decode base64 PEM in pemToDer:", err);
+    await logAudit("Failed to decode base64 PEM in pemToDer: " + (err as Error).message, true);
     throw err;
   }
 }
 
 async function getGoogleAccessToken(): Promise<string> {
+  await loadEnvIfNeeded();
   const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const rawKey = process.env.GOOGLE_PRIVATE_KEY;
   
-  console.log("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL:", email);
-  console.log("AUDIT - GOOGLE_PRIVATE_KEY exists:", !!rawKey);
+  await logAudit("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL: " + email);
+  await logAudit("AUDIT - GOOGLE_PRIVATE_KEY exists: " + !!rawKey);
   if (rawKey) {
-    console.log("AUDIT - GOOGLE_PRIVATE_KEY raw prefix:", rawKey.substring(0, 40));
+    await logAudit("AUDIT - GOOGLE_PRIVATE_KEY raw prefix: " + rawKey.substring(0, 40));
   }
 
   if (!email || !rawKey) {
-    throw new Error("Google service account credentials are not configured.");
+    const errMsg = "Google service account credentials are not configured. EMAIL=" + email + ", KEY_EXISTS=" + !!rawKey;
+    await logAudit(errMsg, true);
+    throw new Error(errMsg);
   }
 
-  // Clean the PEM key
   const privateKeyPem = rawKey.replace(/^"|"$/g, "").replace(/\\n/g, "\n");
-  console.log("AUDIT - privateKeyPem starts with RSA?", privateKeyPem.includes("BEGIN RSA PRIVATE KEY"));
-  console.log("AUDIT - privateKeyPem starts with standard PRIVATE KEY?", privateKeyPem.includes("BEGIN PRIVATE KEY"));
+  await logAudit("AUDIT - privateKeyPem starts with RSA? " + privateKeyPem.includes("BEGIN RSA PRIVATE KEY"));
+  await logAudit("AUDIT - privateKeyPem starts with standard PRIVATE KEY? " + privateKeyPem.includes("BEGIN PRIVATE KEY"));
 
   const now = Math.floor(Date.now() / 1000);
   const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
@@ -80,14 +135,14 @@ async function getGoogleAccessToken(): Promise<string> {
     }),
   );
   const signingInput = `${header}.${payload}`;
-  console.log("AUDIT - JWT signingInput:", signingInput);
+  await logAudit("AUDIT - JWT signingInput: " + signingInput);
 
   let der: Uint8Array;
   try {
-    der = pemToDer(privateKeyPem);
-    console.log("AUDIT - DER byte length:", der.byteLength);
+    der = await pemToDer(privateKeyPem);
+    await logAudit("AUDIT - DER byte length: " + der.byteLength);
   } catch (err) {
-    console.error("AUDIT - Failed to convert PEM to DER:", err);
+    await logAudit("AUDIT - Failed to convert PEM to DER: " + (err as Error).message, true);
     throw err;
   }
 
@@ -100,9 +155,9 @@ async function getGoogleAccessToken(): Promise<string> {
       false,
       ["sign"],
     );
-    console.log("AUDIT - CryptoKey imported successfully");
+    await logAudit("AUDIT - CryptoKey imported successfully");
   } catch (err) {
-    console.error("AUDIT - CryptoKey import failed (crypto.subtle.importKey):", err);
+    await logAudit("AUDIT - CryptoKey import failed (crypto.subtle.importKey): " + (err as Error).message, true);
     throw err;
   }
 
@@ -113,16 +168,16 @@ async function getGoogleAccessToken(): Promise<string> {
       cryptoKey,
       new TextEncoder().encode(signingInput),
     );
-    console.log("AUDIT - Signature generated successfully");
+    await logAudit("AUDIT - Signature generated successfully");
   } catch (err) {
-    console.error("AUDIT - Signing failed:", err);
+    await logAudit("AUDIT - Signing failed: " + (err as Error).message, true);
     throw err;
   }
 
   const jwt = `${signingInput}.${base64url(signature)}`;
-  console.log("AUDIT - JWT created: length =", jwt.length);
+  await logAudit("AUDIT - JWT created: length = " + jwt.length);
 
-  console.log("AUDIT - Fetching Google token...");
+  await logAudit("AUDIT - Fetching Google token...");
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -131,36 +186,43 @@ async function getGoogleAccessToken(): Promise<string> {
 
   if (!res.ok) {
     const text = await res.text();
-    console.error(`AUDIT - Google token exchange response error: ${res.status} ${text}`);
-    throw new Error(`Google token exchange failed: ${res.status} ${text}`);
+    const errMsg = `Google token exchange response error: ${res.status} ${text}`;
+    await logAudit(`AUDIT - ${errMsg}`, true);
+    throw new Error(errMsg);
   }
 
   const json = (await res.json()) as { access_token?: string };
   if (!json.access_token) {
-    console.error("AUDIT - Google token response missing access_token", json);
-    throw new Error("Google token response missing access_token");
+    const errMsg = "Google token response missing access_token";
+    await logAudit(`AUDIT - ${errMsg}: ` + JSON.stringify(json), true);
+    throw new Error(errMsg);
   }
 
-  console.log("AUDIT - Google token exchange response success, access token obtained.");
+  await logAudit("AUDIT - Google token exchange response success, access token obtained.");
   return json.access_token;
 }
 
 export const syncToSheets = createServerFn({ method: "POST" })
   .validator(ApplicationSchema)
   .handler(async ({ data }) => {
-    console.log("AUDIT - syncToSheets starting");
-    console.log("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL:", process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
+    await loadEnvIfNeeded();
+    await logAudit("AUDIT - syncToSheets starting");
+    await logAudit("AUDIT - GOOGLE_SERVICE_ACCOUNT_EMAIL: " + process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL);
     const sheetId = process.env.GOOGLE_SHEET_ID;
-    console.log("AUDIT - GOOGLE_SHEET_ID:", sheetId);
-    console.log("AUDIT - Form Data:", data);
+    await logAudit("AUDIT - GOOGLE_SHEET_ID: " + sheetId);
+    await logAudit("AUDIT - Form Data: " + JSON.stringify(data));
 
-    if (!sheetId) throw new Error("GOOGLE_SHEET_ID is not configured.");
+    if (!sheetId) {
+      const errMsg = "GOOGLE_SHEET_ID is not configured.";
+      await logAudit(errMsg, true);
+      throw new Error(errMsg);
+    }
 
     let token: string;
     try {
       token = await getGoogleAccessToken();
     } catch (err) {
-      console.error("AUDIT - getGoogleAccessToken failed:", err);
+      await logAudit("AUDIT - getGoogleAccessToken failed: " + (err as Error).message, true);
       throw err;
     }
 
@@ -179,31 +241,39 @@ export const syncToSheets = createServerFn({ method: "POST" })
     ];
 
     const range = "Sheet1!A1:append";
-    console.log("AUDIT - Access Token received:", token.substring(0, 15) + "...");
-    console.log("AUDIT - Target spreadsheet ID:", sheetId);
-    console.log("AUDIT - Target range:", range);
+    await logAudit("AUDIT - Access Token received: " + token.substring(0, 15) + "...");
+    await logAudit("AUDIT - Target spreadsheet ID: " + sheetId);
+    await logAudit("AUDIT - Target range: " + range);
 
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}?valueInputOption=USER_ENTERED`;
-    console.log("AUDIT - Appending to Sheets: URL =", url);
+    await logAudit("AUDIT - Appending to Sheets: URL = " + url);
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ values: [row] }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ values: [row] }),
+      });
+    } catch (err) {
+      const errMsg = "Network request to Google Sheets API failed: " + (err as Error).message;
+      await logAudit(errMsg, true);
+      throw new Error(errMsg);
+    }
 
-    console.log("AUDIT - Sheets API response status:", res.status);
+    await logAudit("AUDIT - Sheets API response status: " + res.status);
     if (!res.ok) {
       const text = await res.text();
-      console.error(`AUDIT - Sheets append response error: ${res.status} ${text}`);
-      throw new Error(`Sheets append failed: ${res.status} ${text}`);
+      const errMsg = `Sheets append response error: ${res.status} ${text}`;
+      await logAudit(`AUDIT - ${errMsg}`, true);
+      throw new Error(errMsg);
     }
 
     const resJson = await res.json();
-    console.log("AUDIT - Sheets append response success:", resJson);
+    await logAudit("AUDIT - Sheets append response success: " + JSON.stringify(resJson));
 
     return { ok: true };
   });
